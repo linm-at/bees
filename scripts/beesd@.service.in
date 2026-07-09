@@ -1,13 +1,13 @@
 [Unit]
 Description=Bees (%i)
 Documentation=https://github.com/Zygo/bees
-# Prevents bees from still running while scanned FS is being unmounted
-After=local-fs.target
+After=local-fs.target systemd-udev-settle.service
 Before=umount.target
 
 [Service]
 Type=simple
-ExecStart=@PREFIX@/@BINDIR@/beesd --no-timestamps %i
+ExecStart=/usr/sbin/beesd --no-timestamps %i
+
 CPUSchedulingPolicy=batch
 CPUWeight=12
 IOSchedulingClass=idle
@@ -23,41 +23,27 @@ RuntimeDirectory=bees
 StartupCPUWeight=25
 StartupIOWeight=25
 
-# Give beesd some time to flush everything before shutting down
-TimeoutStopSec=300
+# Give beesd time for ZRAM teardown + flush
+TimeoutStopSec=90
 
 # Hide other users' process in /proc/
 ProtectProc=invisible
 
-# Mount / as read-only
-ProtectSystem=strict
-
-# Forbidden access to /home, /root and /run/user
+# Mount / as read-only, but allow ZRAM sysfs
+ProtectSystem=full
 ProtectHome=true
-
-# Mount tmpfs on /tmp/ and /var/tmp/.
-# Cannot mount at /run/ or /var/run/ for they are used by systemd.
 PrivateTmp=true
-
-# Disable network access
 PrivateNetwork=true
-
-# Use private IPC namespace, utc namespace
 PrivateIPC=true
 ProtectHostname=true
+ProtectKernelTunables=false
+ProtectControlGroups=false
 
-# Disable write access to kernel variables through /proc
-ProtectKernelTunables=true
+# Allow ZRAM control + devices
+ReadWritePaths=/sys /dev
 
-# Disable access to control groups
-ProtectControlGroups=true
-
-# Set capabilities of the new program
-# The first three are required for accessing any file on the mounted filesystem.
-# The last one is required for mounting the filesystem.
+# Capabilities
 AmbientCapabilities=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SYS_ADMIN
-
-# With NoNewPrivileges, running sudo cannot gain any new privilege
 NoNewPrivileges=true
 
 [Install]
