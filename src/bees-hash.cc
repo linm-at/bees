@@ -9,6 +9,8 @@
 
 #include <sys/mman.h>
 
+#include <fstream>
+
 using namespace crucible;
 using namespace std;
 
@@ -364,15 +366,23 @@ BeesHashTable::prefetch_loop()
 		});
 
 		if (not_locked && !m_stop_requested) {
-			// Always do the mlock, whether shared or not
-			THROW_CHECK1(runtime_error, m_size, m_size > 0);
-			BEESLOGINFO("mlock(" << pretty(m_size) << ")...");
-			Timer lock_time;
-			catch_all([&]() {
-				BEESNOTE("mlock " << pretty(m_size));
-				DIE_IF_NON_ZERO(mlock(m_byte_ptr, m_size));
-			});
-			BEESLOGINFO("mlock(" << pretty(m_size) << ") done in " << lock_time << " sec");
+			if (!m_use_zram) {
+				// Standard behavior: lock the memory so it never hits swap
+				THROW_CHECK1(runtime_error, m_size, m_size > 0);
+				BEESLOGINFO("mlock(" << pretty(m_size) << ")...");
+				Timer lock_time;
+				catch_all([&]() {
+					BEESNOTE("mlock " << pretty(m_size));
+					DIE_IF_NON_ZERO(mlock(m_byte_ptr, m_size));
+				});
+				BEESLOGINFO("mlock(" << pretty(m_size) << ") done in " << lock_time << " sec");
+			} else {
+				// ZRAM behavior: leave the memory unlocked so kswapd can push
+				// it down to the compressed block device.
+				BEESLOGINFO("Skipping mlock(" << pretty(m_size) << ") due to ZRAM configuration.");
+			}
+
+			// Flip the flag so we don't evaluate this on the next prefetch cycle
 			not_locked = false;
 		}
 
@@ -689,8 +699,43 @@ BeesHashTable::try_mmap_flags(int flags)
 		THROW_CHECK1(out_of_range, m_size, m_size > 0);
 		Timer map_time;
 		catch_all([&]() {
-			BEESLOGINFO("mapping hash table size " << m_size << " with flags " << mmap_flags_ntoa(flags));
-			void *ptr = mmap_or_die(nullptr, m_size, PROT_READ | PROT_WRITE, flags, flags & MAP_ANONYMOUS ? -1 : int(m_fd), 0);
+			int fd = m_fd;
+			int actual_flags = flags;
+
+			if (m_use_zram) {
+				// Only provision if we haven't already done so
+				if (m_zram_id < 0) {
+					std::ifstream hot_add("/sys/class/zram-control/hot_add");
+					if (!hot_add) THROW_ERRNO("Failed to access zram hot_add");
+					hot_add >> m_zram_id;
+					hot_add.close();
+
+					BEESLOGINFO("Dynamically provisioned /dev/zram" << m_zram_id);
+
+					std::string sysfs_base = "/sys/block/zram" + std::to_string(m_zram_id);
+
+					std::ofstream comp_algo(sysfs_base + "/comp_algorithm");
+					comp_algo << "zstd";
+					comp_algo.close();
+
+					std::ofstream disksize(sysfs_base + "/disksize");
+					disksize << m_size;
+					disksize.close();
+				}
+
+				// Open our dynamically created device
+				std::string dev_path = "/dev/zram" + std::to_string(m_zram_id);
+				fd = open(dev_path.c_str(), O_RDWR);
+				if (fd < 0) THROW_ERRNO("Failed to open dynamic zram device");
+
+				// We must update the class m_fd so the rest of bees knows about it
+				m_fd = fd;
+			}
+
+			BEESLOGINFO("mapping hash table size " << m_size << " with flags " << mmap_flags_ntoa(actual_flags));
+
+			void *ptr = mmap_or_die(nullptr, m_size, PROT_READ | PROT_WRITE, actual_flags, (actual_flags & MAP_ANONYMOUS) ? -1 : fd, 0);
+
 			BEESLOGINFO("mmap done in " << map_time << " sec");
 			m_cell_ptr = static_cast<Cell *>(ptr);
 			void *ptr_end = static_cast<uint8_t *>(ptr) + m_size;
@@ -732,8 +777,9 @@ BeesHashTable::open_file()
 	m_fd = new_fd;
 }
 
-BeesHashTable::BeesHashTable(shared_ptr<BeesContext> ctx, string filename, off_t size) :
+BeesHashTable::BeesHashTable(shared_ptr<BeesContext> ctx, string filename, bool use_zram, off_t size) :
 	m_ctx(ctx),
+	m_use_zram(use_zram),
 	m_size(0),
 	m_void_ptr(nullptr),
 	m_void_ptr_end(nullptr),
@@ -772,7 +818,8 @@ BeesHashTable::BeesHashTable(shared_ptr<BeesContext> ctx, string filename, off_t
 	BEESLOGINFO("\tflush rate limit " << BEES_FLUSH_RATE);
 
 	// Try to mmap that much memory
-	try_mmap_flags(MAP_PRIVATE | MAP_ANONYMOUS);
+	int mmap_flags = m_use_zram ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS;
+	try_mmap_flags(mmap_flags);
 
 	if (!m_cell_ptr) {
 		THROW_ERRNO("unable to mmap " << filename);
@@ -828,16 +875,12 @@ BeesHashTable::BeesHashTable(shared_ptr<BeesContext> ctx, string filename, off_t
 	});
 }
 
+
 BeesHashTable::~BeesHashTable()
 {
 	BEESLOGDEBUG("Destroy BeesHashTable");
 	if (m_cell_ptr && m_size) {
-		// Dirty extents should have been flushed before now,
-		// e.g. in stop().  If that didn't happen, don't fall
-		// into the same trap (and maybe throw an exception) here.
-		// flush_dirty_extents(false);
 		catch_all([&]() {
-			// drop the memory mapping
 			BEESTOOLONG("unmap handle table size " << pretty(m_size));
 			DIE_IF_NON_ZERO(munmap(m_cell_ptr, m_size));
 		});
@@ -865,6 +908,69 @@ BeesHashTable::stop_request()
 }
 
 void
+BeesHashTable::cleanup_zram()
+{
+	if (!m_use_zram || m_zram_id < 0) {
+		return;
+	}
+
+	BEESLOGINFO("Initiating manual ZRAM teardown for /dev/zram" << m_zram_id << "...");
+
+	// 1. Drop the memory mapping boundaries
+	if (m_cell_ptr && m_size) {
+		catch_all([&]() {
+			munmap(m_cell_ptr, m_size);
+		});
+		m_cell_ptr = nullptr;
+		m_size = 0;
+	}
+
+	// 2. Break the VFS lock using a raw POSIX close
+	catch_all([&]() {
+		int raw_fd = static_cast<int>(m_fd);
+		if (raw_fd >= 0) {
+			::close(raw_fd);
+		}
+	});
+
+	std::string sysfs_base = "/sys/block/zram" + std::to_string(m_zram_id);
+
+	// 3. Reset the device state to 0 (uninitializes disksize)
+	int reset_fd = ::open((sysfs_base + "/reset").c_str(), O_WRONLY);
+	if (reset_fd >= 0) {
+		::write(reset_fd, "1", 1);
+		::close(reset_fd);
+	}
+
+	// Give udev 50ms to finish reacting to the reset event
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+	// 4. Wipe the block node out of the kernel space completely
+	int remove_fd = ::open("/sys/class/zram-control/hot_remove", O_WRONLY);
+	if (remove_fd >= 0) {
+		std::string id_str = std::to_string(m_zram_id);
+		int retries = 10;
+
+		while (retries-- > 0) {
+			if (::write(remove_fd, id_str.c_str(), id_str.length()) >= 0) {
+				BEESLOGINFO("Dynamic /dev/zram" << m_zram_id << " successfully vaporized.");
+				break;
+			}
+			if (errno == EBUSY) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				continue;
+			}
+			BEESLOGWARN("Failed to write hot_remove: " << strerror(errno));
+			break;
+		}
+		::close(remove_fd);
+	}
+
+	// Flag it as removed so we don't accidentally try again
+	m_zram_id = -1;
+}
+
+void
 BeesHashTable::stop_wait()
 {
 	BEESNOTE("waiting for hash_prefetch thread");
@@ -876,4 +982,7 @@ BeesHashTable::stop_wait()
 	m_writeback_thread.join();
 
 	BEESLOGDEBUG("BeesHashTable stopped");
+
+	// Call the manual cleanup override here
+	cleanup_zram();
 }

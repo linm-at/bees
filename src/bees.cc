@@ -791,6 +791,7 @@ bees_main(int argc, char *argv[])
 	unsigned thread_min = 0;
 	double load_target = 0;
 	bool workaround_btrfs_send = false;
+	bool use_zram = false;
 	BeesRoots::ScanMode root_scan_mode = BeesRoots::SCAN_MODE_EXTENT;
 
 	// Configure getopt_long
@@ -812,6 +813,7 @@ bees_main(int argc, char *argv[])
 		{ .name = "absolute-paths",        .has_arg = no_argument,       .val = 'p' },
 		{ .name = "timestamps",            .has_arg = no_argument,       .val = 't' },
 		{ .name = "verbose",               .has_arg = required_argument, .val = 'v' },
+		{ .name = "use-zram",              .has_arg = no_argument,       .val = 'z' },
 		{ 0 },
 	};
 
@@ -888,7 +890,9 @@ bees_main(int argc, char *argv[])
 					BEESLOGNOTICE("log level set to " << bees_log_level);
 				}
 				break;
-
+			case 'z':
+				use_zram = true;
+				break;
 			case 'h':
 			default:
 				do_cmd_help(argv);
@@ -939,6 +943,10 @@ bees_main(int argc, char *argv[])
 
 	BEESLOGNOTICE("setting throttle factor to " << bees_throttle_factor);
 
+	if(use_zram) {
+		BEESLOGNOTICE("Using ZRAM");
+	}
+	bc->set_use_zram(use_zram);
 	// Set root path
 	string root_path = argv[optind++];
 	BEESLOGNOTICE("setting root path to '" << root_path << "'");

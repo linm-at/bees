@@ -1297,7 +1297,7 @@ BeesContext::hash_table()
 {
 	unique_lock<mutex> lock(m_stop_mutex);
 	if (!m_hash_table) {
-		m_hash_table = make_shared<BeesHashTable>(shared_from_this(), "beeshash.dat");
+		m_hash_table = make_shared<BeesHashTable>(shared_from_this() ,"beeshash.dat", m_use_zram);
 	}
 	return m_hash_table;
 }
@@ -1309,3 +1309,6 @@ BeesContext::set_root_path(string path)
 	m_root_path = path;
 	set_root_fd(open_or_die(m_root_path, FLAGS_OPEN_DIR));
 }
+
+void
+BeesContext::set_use_zram(bool use_zram) { m_use_zram = use_zram; }

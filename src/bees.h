@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <random>
+#include <sys/syslog.h>
 #include <thread>
 
 #include <endian.h>
@@ -138,6 +139,7 @@ extern int bees_trace_level;
 #define BEESLOGNOTICE(x) BEESLOG(LOG_NOTICE, x)
 #define BEESLOGINFO(x)   BEESLOG(LOG_INFO, x)
 #define BEESLOGDEBUG(x)  BEESLOG(LOG_DEBUG, x)
+
 
 #define BEESLOGONCE(__x) do { \
         static bool already_logged = false; \
@@ -425,11 +427,13 @@ public:
 		uint8_t	p_byte[BLOCK_SIZE_HASHTAB_EXTENT];
 	} __attribute__((packed));
 
-	BeesHashTable(shared_ptr<BeesContext> ctx, string filename, off_t size = BLOCK_SIZE_HASHTAB_EXTENT);
+	BeesHashTable(shared_ptr<BeesContext> ctx, string filename, bool use_zram, off_t size = BLOCK_SIZE_HASHTAB_EXTENT);
 	~BeesHashTable();
 
 	void stop_request();
 	void stop_wait();
+
+	void cleanup_zram();
 
 	vector<Cell>	find_cell(HashType hash);
 	bool		push_random_hash_addr(HashType hash, AddrType addr);
@@ -440,6 +444,8 @@ public:
 private:
 	string		m_filename;
 	Fd		m_fd;
+	const bool m_use_zram;
+	int m_zram_id = -1;
 	uint64_t	m_size;
 	union {
 		void	*m_void_ptr;	// Save some casting
@@ -768,6 +774,7 @@ class BeesContext : public enable_shared_from_this<BeesContext> {
 
 	mutex						m_progress_mtx;
 	string						m_progress_str;
+	bool 						m_use_zram = false;
 
 	void set_root_fd(Fd fd);
 
@@ -777,6 +784,8 @@ class BeesContext : public enable_shared_from_this<BeesContext> {
 	void rewrite_file_range(const BeesFileRange &bfr);
 
 public:
+
+	void set_use_zram(bool use_zram);
 
 	void set_root_path(string path);
 
